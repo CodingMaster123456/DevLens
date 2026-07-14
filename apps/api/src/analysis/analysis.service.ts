@@ -13,8 +13,14 @@ export interface ParsedFile {
 export interface GraphNode {
   id: string;
   label: string;
-  functions: number;
-  classes: number;
+  functions: string[];
+  classes: string[];
+  imports: string[];
+  stats: {
+    functions: number;
+    classes: number;
+    imports: number;
+  };
 }
 
 export interface GraphEdge {
@@ -25,6 +31,14 @@ export interface GraphEdge {
 export interface DependencyGraph {
   nodes: GraphNode[];
   edges: GraphEdge[];
+  summary: {
+    totalFiles: number;
+    totalFunctions: number;
+    totalClasses: number;
+    totalImports: number;
+    totalEdges: number;
+    analysisTimeMs: number;
+  };
 }
 
 @Injectable()
@@ -38,22 +52,27 @@ export class AnalysisService {
   }
 
   buildGraph(parsedFiles: ParsedFile[]): DependencyGraph {
+    const startTime = performance.now();
     const filePathSet = new Set(parsedFiles.map((f) => f.filePath));
 
     const nodes: GraphNode[] = parsedFiles.map((f) => ({
       id: f.filePath,
       label: path.basename(f.filePath),
-      functions: f.functions.length,
-      classes: f.classes.length,
+      functions: f.functions,
+      classes: f.classes,
+      imports: f.imports,
+      stats: {
+        functions: f.functions.length,
+        classes: f.classes.length,
+        imports: f.imports.length,
+      },
     }));
 
     const edges: GraphEdge[] = [];
 
     for (const file of parsedFiles) {
       for (const imp of file.imports) {
-        // only care about relative imports (internal repo files), skip external packages
         if (!imp.startsWith('.')) continue;
-
         const resolved = this.resolveImport(file.filePath, imp, filePathSet);
         if (resolved) {
           edges.push({ source: file.filePath, target: resolved });
@@ -61,7 +80,20 @@ export class AnalysisService {
       }
     }
 
-    return { nodes, edges };
+    const analysisTimeMs = Math.round(performance.now() - startTime);
+
+    return {
+      nodes,
+      edges,
+      summary: {
+        totalFiles: parsedFiles.length,
+        totalFunctions: parsedFiles.reduce((sum, f) => sum + f.functions.length, 0),
+        totalClasses: parsedFiles.reduce((sum, f) => sum + f.classes.length, 0),
+        totalImports: parsedFiles.reduce((sum, f) => sum + f.imports.length, 0),
+        totalEdges: edges.length,
+        analysisTimeMs,
+      },
+    };
   }
 
   private resolveImport(fromFile: string, importPath: string, filePathSet: Set<string>): string | null {
@@ -105,12 +137,7 @@ export class AnalysisService {
 
   private parseFile(filePath: string, rootDir: string): ParsedFile {
     const source = fs.readFileSync(filePath, 'utf-8');
-    const sourceFile = ts.createSourceFile(
-      filePath,
-      source,
-      ts.ScriptTarget.Latest,
-      true,
-    );
+    const sourceFile = ts.createSourceFile(filePath, source, ts.ScriptTarget.Latest, true);
 
     const functions: string[] = [];
     const classes: string[] = [];
@@ -130,6 +157,14 @@ export class AnalysisService {
       }
       if (ts.isClassDeclaration(node) && node.name) {
         classes.push(node.name.text);
+        for (const member of node.members) {
+          if (ts.isMethodDeclaration(member) && member.name && ts.isIdentifier(member.name)) {
+            functions.push(`${node.name.text}.${member.name.text}`);
+          }
+          if (ts.isConstructorDeclaration(member)) {
+            functions.push(`${node.name.text}.constructor`);
+          }
+        }
       }
       if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
         imports.push(node.moduleSpecifier.text);
